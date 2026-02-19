@@ -20,7 +20,7 @@
 
     - name: Get the SSH authorized keys from the login user
       ansible.builtin.slurp:
-        src: "/home/{{ ansible_user }}/.ssh/authorized_keys"
+        src: "/home/champuser/.ssh/authorized_keys"
       register: login_user_ssh_keys
 
     - name: Ensure .ssh directory exists for each new user
