@@ -40,3 +40,12 @@
         group: "{{ item.name }}"
         mode: '0600'
       loop: "{{ users }}"
+
+    - name: Add users to sudoers.d
+      ansible.builtin.copy:
+        content: "{{ item.name }} ALL=(ALL) NOPASSWD: ALL\n"
+        dest: "/etc/sudoers.d/{{ item.name }}"
+        owner: root
+        group: root
+        mode: '0440'
+      loop: "{{ users }}"
