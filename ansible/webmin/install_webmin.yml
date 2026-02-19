@@ -1,0 +1,39 @@
+# install_webmin.yml
+---
+- name: Install and configure Webmin
+  hosts: servers
+  become: yes
+  tasks:
+    - name: Download Webmin repository setup script
+      ansible.builtin.get_url:
+        url: https://raw.githubusercontent.com/webmin/webmin/master/setup-repos.sh
+        dest: /tmp/setup-repos.sh
+        mode: '0755'
+
+    - name: Run Webmin repository setup script
+      ansible.builtin.command:
+        cmd: sh /tmp/setup-repos.sh --force
+      args:
+        creates: /etc/yum.repos.d/webmin.repo
+
+    - name: Install Webmin
+      ansible.builtin.dnf:
+        name: webmin
+        state: present
+
+    - name: Ensure Webmin service is started and enabled
+      ansible.builtin.systemd:
+        name: webmin
+        state: started
+        enabled: yes
+
+    - name: Open Webmin port 10000 in firewalld
+      ansible.posix.firewalld:
+        port: 10000/tcp
+        permanent: yes
+        state: enabled
+
+    - name: Reload firewalld
+      ansible.builtin.systemd:
+        name: firewalld
+        state: reloaded
