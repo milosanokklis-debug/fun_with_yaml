@@ -4,7 +4,7 @@
   hosts: servers
   become: yes # Use privilege escalation (e.g., sudo)
   vars_files:
-    - vars/users.yml
+    - ./users.yml
   tasks:
     - name: Add several users with specific properties
       ansible.builtin.user:
