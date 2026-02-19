@@ -1,0 +1,14 @@
+# to make passwords
+# mkpasswd -m sha-512
+
+# vars/users.yml
+users:
+  - name: testuser1
+    comment: "Test User 1"
+    groups: "users"
+    # Example hashed password (replace with your own secure hash)
+    password: "$6$rounds=65536$yqBfGzHkL...$..." 
+  - name: testuser2
+    comment: "Test User 2"
+    groups: "wheel"
+    password: "$6$rounds=65536$yqBfGzHkL...$..."
