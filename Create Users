@@ -1,0 +1,19 @@
+# create_users.yml
+---
+- name: Create multiple users
+  hosts: servers
+  become: yes # Use privilege escalation (e.g., sudo)
+  vars_files:
+    - vars/users.yml
+  tasks:
+    - name: Add several users with specific properties
+      ansible.builtin.user:
+        name: "{{ item.name }}"
+        state: present
+        comment: "{{ item.comment }}"
+        password: "{{ item.password }}"
+        groups: "{{ item.groups }}"
+        append: yes # Append to existing groups rather than replacing
+        createhome: yes
+        shell: /bin/bash
+      loop: "{{ users }}" # Loop through the 'users' list defined in the vars file
