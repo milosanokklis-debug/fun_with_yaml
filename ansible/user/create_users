@@ -17,24 +17,24 @@
         createhome: yes
         shell: /bin/bash
       loop: "{{ users }}" # Loop through the 'users' list defined in the vars file
-- name: Get the SSH authorized keys from the login user
-      ansible.builtin.slurp:
-        src: "/home/{{ ansible_user }}/.ssh/authorized_keys"
-      register: login_user_ssh_keys
-    - name: Ensure .ssh directory exists for each new user
-      ansible.builtin.file:
-        path: "/home/{{ item.name }}/.ssh"
-        state: directory
-        owner: "{{ item.name }}"
-        group: "{{ item.name }}"
-        mode: '0700'
-      loop: "{{ users }}"
-
-    - name: Copy SSH authorized keys to each new user
-      ansible.builtin.copy:
-        content: "{{ login_user_ssh_keys['content'] | b64decode }}"
-        dest: "/home/{{ item.name }}/.ssh/authorized_keys"
-        owner: "{{ item.name }}"
-        group: "{{ item.name }}"
-        mode: '0600'
-      loop: "{{ users }}"
+    - name: Get the SSH authorized keys from the login user
+          ansible.builtin.slurp:
+            src: "/home/{{ ansible_user }}/.ssh/authorized_keys"
+          register: login_user_ssh_keys
+        - name: Ensure .ssh directory exists for each new user
+          ansible.builtin.file:
+            path: "/home/{{ item.name }}/.ssh"
+            state: directory
+            owner: "{{ item.name }}"
+            group: "{{ item.name }}"
+            mode: '0700'
+          loop: "{{ users }}"
+    
+        - name: Copy SSH authorized keys to each new user
+          ansible.builtin.copy:
+            content: "{{ login_user_ssh_keys['content'] | b64decode }}"
+            dest: "/home/{{ item.name }}/.ssh/authorized_keys"
+            owner: "{{ item.name }}"
+            group: "{{ item.name }}"
+            mode: '0600'
+          loop: "{{ users }}"
