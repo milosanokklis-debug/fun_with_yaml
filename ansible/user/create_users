@@ -4,7 +4,7 @@
   hosts: servers
   become: yes
   vars_files:
-    - ./users.yml
+    - home/champuser/fun_with_yaml/ansible/users_data
   tasks:
     - name: Add several users with specific properties
       ansible.builtin.user:
