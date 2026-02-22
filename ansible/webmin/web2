@@ -1,0 +1,19 @@
+---
+- name: Make a webmin on rocky
+  hosts: webmin
+  become: true
+  become_user: root
+  
+  vars:
+    enable_firewalld: true
+    install_utilities: false
+  roles:
+  - semuadmin.webmin
+
+
+  tasks:
+  - name: add firewall rule
+    firewalld:
+      port: 10000/tcp
+      permanent: true
+      state: enabled
