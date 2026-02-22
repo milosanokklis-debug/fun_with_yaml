@@ -1,0 +1,8 @@
+---
+# using the following repo
+# ansible-galaxy role install geerlingguy.docker
+- name: Setting up basic docker for rocky
+  hosts: all
+  become: yes
+  roles:
+    - geerlingguy.docker
