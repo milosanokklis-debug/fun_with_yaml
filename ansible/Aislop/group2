@@ -344,15 +344,6 @@
         state: present
       notify: Restart SSHD
 
-    - name: "Verify sshd_config changes"
-      ansible.builtin.command: "sshd -T | grep -E 'passwordauthentication|permitrootlogin|clientaliveinterval'"
-      register: sshd_verify
-      changed_when: false
-
-    - name: "Display SSH config verification"
-      ansible.builtin.debug:
-        var: sshd_verify.stdout_lines
-
   handlers:
     - name: Restart SSHD
       ansible.builtin.service:
