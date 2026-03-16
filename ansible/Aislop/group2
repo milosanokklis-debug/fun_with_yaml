@@ -1,0 +1,558 @@
+---
+# =============================================================================
+# GROUP 02 - Ansible Lab Playbook
+# =============================================================================
+# OBJECTIVES:
+#   - SysAdmin Task 1 : Manage local user accounts on all hosts
+#   - SysAdmin Task 2 : Configure and verify firewall rules on all hosts
+#   - Hardening Task 1: Disable unused services on all hosts
+#   - Hardening Task 2: Enforce SSH key-only authentication (Rocky hosts)
+#                       and enforce TLS/HTTPS requirements (Windows)
+#   - GPO Task 1      : Restrict access to Control Panel (User config)
+#   - GPO Task 2      : Enforce screen lock/idle timeout
+#   - GPO Task 3      : Disable removable storage write access
+#
+# ENVIRONMENT ASSUMPTIONS:
+#   - Inventory groups: [windows] = AD01, MGMT01, WKS01
+#                       [rocky]   = Ansible01, Ansible02
+#   - WinRM configured on Windows hosts
+#   - SSH configured on Rocky hosts
+#   - Domain joined Windows hosts can apply local policy supplements
+#
+# USAGE:
+#   Dry-run (recommended first step):
+#     ansible-playbook group_02.yml --check
+#   Apply:
+#     ansible-playbook group_02.yml
+# =============================================================================
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 1: SysAdmin - Create a local lab user on Rocky hosts
+# WHY: Having a consistent local service/test account is useful in lab
+#      environments for testing sudo, permissions, and group memberships.
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "SYSADMIN-01 | Manage local lab user on Rocky hosts"
+  hosts: rocky
+  become: true
+
+  vars:
+    lab_user: "labadmin"
+    lab_groups:
+      - wheel     # Grants sudo on Rocky/RHEL systems
+    lab_comment: "Lab Admin Account - Ansible Managed"
+
+  tasks:
+
+    - name: "Ensure lab user '{{ lab_user }}' exists"
+      ansible.builtin.user:
+        name: "{{ lab_user }}"
+        comment: "{{ lab_comment }}"
+        groups: "{{ lab_groups }}"
+        append: true           # Add to groups without removing existing ones
+        shell: /bin/bash
+        state: present
+        create_home: true
+      register: user_result
+
+    - name: "Debug - Show user creation result"
+      ansible.builtin.debug:
+        msg: "User '{{ lab_user }}' changed: {{ user_result.changed }} on {{ inventory_hostname }}"
+
+    - name: "Ensure .ssh directory exists for lab user"
+      ansible.builtin.file:
+        path: "/home/{{ lab_user }}/.ssh"
+        state: directory
+        owner: "{{ lab_user }}"
+        group: "{{ lab_user }}"
+        mode: '0700'   # Strict permissions required by SSH
+
+    - name: "Verify user exists in /etc/passwd"
+      ansible.builtin.command: "getent passwd {{ lab_user }}"
+      register: passwd_check
+      changed_when: false
+
+    - name: "Display user record"
+      ansible.builtin.debug:
+        var: passwd_check.stdout
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 2: SysAdmin - Create a local lab user on Windows hosts
+# WHY: Consistent local accounts help test Group Policy and privilege scoping
+#      without relying solely on domain accounts.
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "SYSADMIN-01 | Manage local lab user on Windows hosts"
+  hosts: windows
+  gather_facts: false
+
+  vars:
+    win_lab_user: "labadmin"
+    win_lab_desc: "Lab Admin - Ansible Managed"
+
+  tasks:
+
+    - name: "Create local user '{{ win_lab_user }}' on Windows"
+      # ansible.windows.win_user manages local Windows user accounts
+      ansible.windows.win_user:
+        name: "{{ win_lab_user }}"
+        description: "{{ win_lab_desc }}"
+        password: "LabP@ssw0rd!23"    # Change to vault-encrypted value in production
+        password_never_expires: false
+        account_disabled: false
+        state: present
+      register: win_user_result
+
+    - name: "Debug - Windows user result"
+      ansible.builtin.debug:
+        msg: "{{ win_lab_user }} on {{ inventory_hostname }} changed: {{ win_user_result.changed }}"
+
+    - name: "Add lab user to local Administrators group"
+      ansible.windows.win_group_membership:
+        name: Administrators
+        members:
+          - "{{ win_lab_user }}"
+        state: present
+
+    - name: "Verify user exists via PowerShell"
+      ansible.windows.win_shell: |
+        Get-LocalUser -Name "{{ win_lab_user }}" | Select-Object Name, Enabled | Format-Table | Out-String
+      register: user_verify
+      changed_when: false
+
+    - name: "Display Windows user verification"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ user_verify.stdout }}"
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 3: SysAdmin - Configure firewalld rules on Rocky hosts
+# WHY: Firewalld is the default firewall manager on Rocky Linux.
+#      Using ansible.posix.firewalld avoids raw iptables commands per spec.
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "SYSADMIN-02 | Configure firewalld on Rocky hosts"
+  hosts: rocky
+  become: true
+
+  vars:
+    # Define services to allow through the firewall
+    allowed_services:
+      - ssh
+      - http
+      - https
+
+  tasks:
+
+    - name: "Ensure firewalld is installed"
+      ansible.builtin.dnf:
+        name: firewalld
+        state: present
+
+    - name: "Ensure firewalld is enabled and running"
+      ansible.builtin.service:
+        name: firewalld
+        state: started
+        enabled: true
+
+    - name: "Allow required services in firewalld (permanent)"
+      # ansible.posix.firewalld module manages firewalld zones and rules
+      ansible.posix.firewalld:
+        service: "{{ item }}"
+        state: enabled
+        permanent: true    # Survives reboot
+        immediate: true    # Apply now without reload
+        zone: public
+      loop: "{{ allowed_services }}"
+      register: fw_result
+
+    - name: "Debug - Show firewalld rule changes"
+      ansible.builtin.debug:
+        msg: "Firewalld service '{{ item.item }}' changed: {{ item.changed }}"
+      loop: "{{ fw_result.results }}"
+
+    - name: "List active firewalld rules (verification)"
+      ansible.builtin.command: firewall-cmd --list-all
+      register: fw_list
+      changed_when: false
+
+    - name: "Display active firewall rules"
+      ansible.builtin.debug:
+        msg: |
+          === Firewall Rules on {{ inventory_hostname }} ===
+          {{ fw_list.stdout }}
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 4: SysAdmin - Review Windows Firewall profile status
+# WHY: Windows Firewall should be enabled on all profiles (Domain, Public,
+#      Private). We audit state and ensure Domain profile is on.
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "SYSADMIN-02 | Verify Windows Firewall profiles are active"
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+
+    - name: "Retrieve Windows Firewall profile status"
+      ansible.windows.win_shell: |
+        Get-NetFirewallProfile | Select-Object Name, Enabled | Format-Table | Out-String
+      register: fw_status
+      changed_when: false
+
+    - name: "Display Windows Firewall profile status"
+      ansible.builtin.debug:
+        msg: |
+          === Firewall Profiles: {{ inventory_hostname }} ===
+          {{ fw_status.stdout }}
+
+    - name: "Ensure Domain firewall profile is enabled"
+      # ansible.windows.win_shell runs a PowerShell command to enforce state
+      ansible.windows.win_shell: |
+        Set-NetFirewallProfile -Profile Domain -Enabled True
+      register: fw_enable
+      changed_when: fw_enable.rc == 0
+
+    - name: "Ensure Private and Public profiles are also enabled"
+      ansible.windows.win_shell: |
+        Set-NetFirewallProfile -Profile Private, Public -Enabled True
+      register: fw_enable_all
+      changed_when: fw_enable_all.rc == 0
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 5: Hardening - Disable unused services on Rocky hosts
+# WHY: Reducing the attack surface by stopping and disabling services that
+#      are not needed (telnet, rsh, etc.) - CIS Benchmark recommendations.
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "HARDENING-01 | Disable unused legacy services (Rocky)"
+  hosts: rocky
+  become: true
+
+  vars:
+    # Services to stop and disable if present
+    unused_services:
+      - telnet
+      - rsh
+      - rlogin
+      - vsftpd    # FTP (unencrypted); disable unless explicitly needed
+      - avahi-daemon  # mDNS - often unneeded in server environments
+
+  tasks:
+
+    - name: "Stop and disable unused services (if they exist)"
+      ansible.builtin.service:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      loop: "{{ unused_services }}"
+      # Gracefully handle cases where a service doesn't exist on this host
+      ignore_errors: true
+      register: svc_disable_result
+
+    - name: "Report which services were changed"
+      ansible.builtin.debug:
+        msg: >
+          Service '{{ item.item }}': changed={{ item.changed }}
+          (failed={{ item.failed }})
+      loop: "{{ svc_disable_result.results }}"
+
+    - name: "Verify running services snapshot"
+      ansible.builtin.command: systemctl list-units --type=service --state=running
+      register: running_services
+      changed_when: false
+
+    - name: "Display running services"
+      ansible.builtin.debug:
+        msg: |
+          === Running Services on {{ inventory_hostname }} ===
+          {{ running_services.stdout }}
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 6: Hardening - Disable unused Windows services
+# WHY: Services like Remote Registry, Telnet, and SSDP add attack surface.
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "HARDENING-01 | Disable unused Windows services"
+  hosts: windows
+  gather_facts: false
+
+  vars:
+    win_unused_services:
+      - RemoteRegistry    # Remote Registry - allows remote registry editing
+      - TlntSvr           # Telnet Server
+      - SSDPSRV           # SSDP Discovery - UPnP related
+      - upnphost          # Universal Plug and Play
+
+  tasks:
+
+    - name: "Stop and disable unused Windows services"
+      ansible.windows.win_service:
+        name: "{{ item }}"
+        state: stopped
+        start_mode: disabled
+      loop: "{{ win_unused_services }}"
+      ignore_errors: true   # Some services may not exist; skip gracefully
+      register: win_svc_result
+
+    - name: "Report Windows service disable results"
+      ansible.builtin.debug:
+        msg: "Service '{{ item.item }}' changed: {{ item.changed }} | failed: {{ item.failed }}"
+      loop: "{{ win_svc_result.results }}"
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 7: Hardening - Enforce SSH key authentication only (Rocky)
+# WHY: Password-based SSH auth is vulnerable to brute-force attacks.
+#      Key-only auth is a fundamental hardening step.
+# NOTE: Ensure public keys are deployed BEFORE running this play!
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "HARDENING-02 | Enforce SSH key-only auth on Rocky hosts"
+  hosts: rocky
+  become: true
+
+  tasks:
+
+    - name: "Disable SSH password authentication"
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PasswordAuthentication'
+        line: 'PasswordAuthentication no'
+        state: present
+      notify: Restart SSHD
+
+    - name: "Disable challenge-response authentication"
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?ChallengeResponseAuthentication'
+        line: 'ChallengeResponseAuthentication no'
+        state: present
+      notify: Restart SSHD
+
+    - name: "Disable root SSH login"
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PermitRootLogin'
+        line: 'PermitRootLogin no'
+        state: present
+      notify: Restart SSHD
+
+    - name: "Set SSH idle timeout (5 min)"
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?ClientAliveInterval'
+        line: 'ClientAliveInterval 300'
+        state: present
+      notify: Restart SSHD
+
+    - name: "Verify sshd_config changes"
+      ansible.builtin.command: "sshd -T | grep -E 'passwordauthentication|permitrootlogin|clientaliveinterval'"
+      register: sshd_verify
+      changed_when: false
+
+    - name: "Display SSH config verification"
+      ansible.builtin.debug:
+        var: sshd_verify.stdout_lines
+
+  handlers:
+    - name: Restart SSHD
+      ansible.builtin.service:
+        name: sshd
+        state: restarted
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 8: Hardening - Require strong TLS/Schannel settings (Windows)
+# WHY: Weak SSL/TLS protocols (SSLv3, TLS 1.0) should be disabled.
+#      Registry paths control Schannel behavior on Windows Server.
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "HARDENING-02 | Disable weak TLS protocols on Windows hosts"
+  hosts: windows
+  gather_facts: false
+
+  vars:
+    # Protocol subkeys to disable; Client + Server both need to be disabled
+    weak_protocols:
+      - "SSL 2.0"
+      - "SSL 3.0"
+      - "TLS 1.0"
+      - "TLS 1.1"
+
+  tasks:
+
+    - name: "Disable weak protocol - Server sub-key"
+      ansible.windows.win_regedit:
+        path: "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\SecurityProviders\\SCHANNEL\\Protocols\\{{ item }}\\Server"
+        name: Enabled
+        data: 0
+        type: dword
+      loop: "{{ weak_protocols }}"
+
+    - name: "Disable weak protocol - Client sub-key"
+      ansible.windows.win_regedit:
+        path: "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\SecurityProviders\\SCHANNEL\\Protocols\\{{ item }}\\Client"
+        name: Enabled
+        data: 0
+        type: dword
+      loop: "{{ weak_protocols }}"
+
+    - name: "Explicitly enable TLS 1.2 Server"
+      ansible.windows.win_regedit:
+        path: HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.2\Server
+        name: Enabled
+        data: 1
+        type: dword
+
+    - name: "Explicitly enable TLS 1.2 Client"
+      ansible.windows.win_regedit:
+        path: HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.2\Client
+        name: Enabled
+        data: 1
+        type: dword
+
+    - name: "Inform that a reboot is required for Schannel changes to apply"
+      ansible.builtin.debug:
+        msg: "NOTE: Schannel changes on {{ inventory_hostname }} require a reboot to fully take effect."
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 9: GPO-01 - Restrict Control Panel access for standard users (User cfg)
+# WHY: Limiting Control Panel access prevents users from changing system
+#      settings. Equivalent to User Config > Admin Templates > Control Panel
+#      > Prohibit access to Control Panel and PC settings.
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "GPO-01 | Restrict Control Panel via registry (Windows)"
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+
+    - name: "Set NoControlPanel registry key in user hive (HKCU default)"
+      # HKU\.DEFAULT applies to the default user profile (new users inherit it)
+      ansible.windows.win_regedit:
+        path: HKU:\.DEFAULT\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer
+        name: NoControlPanel
+        data: 1
+        type: dword
+
+    - name: "Apply to HKLM for machine-wide enforcement"
+      ansible.windows.win_regedit:
+        path: HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer
+        name: NoControlPanel
+        data: 1
+        type: dword
+
+    - name: "Verify Control Panel restriction"
+      ansible.windows.win_shell: |
+        $val = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer" -ErrorAction SilentlyContinue).NoControlPanel
+        Write-Output "NoControlPanel = $val"
+      register: cp_check
+      changed_when: false
+
+    - name: "Display Control Panel restriction status"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ cp_check.stdout }}"
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 10: GPO-02 - Enforce screen lock / idle session timeout (Windows)
+# WHY: Unattended workstations are a physical access risk.
+#      Equivalent to: User Config > Admin Templates > Control Panel
+#      > Personalization > Screen Saver settings.
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "GPO-02 | Enforce screen lock after idle timeout (Windows)"
+  hosts: windows
+  gather_facts: false
+
+  vars:
+    idle_timeout_seconds: "600"   # 10 minutes before screensaver activates
+
+  tasks:
+
+    - name: "Enable screensaver via registry"
+      ansible.windows.win_regedit:
+        path: HKU:\.DEFAULT\Control Panel\Desktop
+        name: ScreenSaveActive
+        data: "1"
+        type: string
+
+    - name: "Set screensaver timeout to {{ idle_timeout_seconds }} seconds"
+      ansible.windows.win_regedit:
+        path: HKU:\.DEFAULT\Control Panel\Desktop
+        name: ScreenSaveTimeOut
+        data: "{{ idle_timeout_seconds }}"
+        type: string
+
+    - name: "Require password on screensaver resume"
+      ansible.windows.win_regedit:
+        path: HKU:\.DEFAULT\Control Panel\Desktop
+        name: ScreenSaverIsSecure
+        data: "1"
+        type: string
+
+    - name: "Also apply machine-level lock via power/screensaver policy"
+      ansible.windows.win_regedit:
+        path: HKLM:\SOFTWARE\Policies\Microsoft\Windows\Control Panel\Desktop
+        name: ScreenSaveTimeOut
+        data: "{{ idle_timeout_seconds }}"
+        type: string
+
+    - name: "Confirm screensaver timeout value"
+      ansible.windows.win_shell: |
+        $val = (Get-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Control Panel\Desktop" -ErrorAction SilentlyContinue).ScreenSaveTimeOut
+        Write-Output "ScreenSaveTimeOut = $val seconds"
+      register: ss_check
+      changed_when: false
+
+    - name: "Show screensaver timeout confirmation"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ ss_check.stdout }}"
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 11: GPO-03 - Disable write access to removable storage (Windows)
+# WHY: USB write access is a primary data exfiltration vector.
+#      Equivalent to: Computer Config > Admin Templates > System
+#      > Removable Storage Access > Removable Disks: Deny write access
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "GPO-03 | Disable removable storage write access (Windows)"
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+
+    - name: "Deny write access to removable disks"
+      ansible.windows.win_regedit:
+        path: HKLM:\SOFTWARE\Policies\Microsoft\Windows\RemovableStorageDevices\{53f5630d-b6bf-11d0-94f2-00a0c91efb8b}
+        name: Deny_Write
+        data: 1
+        type: dword
+
+    - name: "Deny write access to CD/DVD drives"
+      ansible.windows.win_regedit:
+        path: HKLM:\SOFTWARE\Policies\Microsoft\Windows\RemovableStorageDevices\{53f56308-b6bf-11d0-94f2-00a0c91efb8b}
+        name: Deny_Write
+        data: 1
+        type: dword
+
+    - name: "Verify removable storage write restriction"
+      ansible.windows.win_shell: |
+        $path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\RemovableStorageDevices"
+        $keys = Get-ChildItem $path -ErrorAction SilentlyContinue
+        foreach ($key in $keys) {
+          $deny = (Get-ItemProperty $key.PSPath -ErrorAction SilentlyContinue).Deny_Write
+          Write-Output "$($key.PSChildName): Deny_Write=$deny"
+        }
+      register: storage_check
+      changed_when: false
+
+    - name: "Display removable storage policy status"
+      ansible.builtin.debug:
+        msg: |
+          === Removable Storage Policy: {{ inventory_hostname }} ===
+          {{ storage_check.stdout }}
+
+# =============================================================================
+# END OF GROUP 02
+# Next: Run group_03.yml
+# Tip: Always run with --check first!
+# =============================================================================
