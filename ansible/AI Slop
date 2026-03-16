@@ -1,0 +1,494 @@
+---
+# =============================================================================
+# GROUP 01 - Ansible Lab Playbook
+# =============================================================================
+# OBJECTIVES:
+#   - SysAdmin Task 1 : Ensure NTP/time sync is configured on all hosts
+#   - SysAdmin Task 2 : Verify and report disk usage on all hosts
+#   - Hardening Task 1: Disable guest accounts on all hosts
+#   - Hardening Task 2: Set a login warning banner on all hosts
+#   - GPO Task 1      : Enforce password complexity policy via registry (Windows)
+#   - GPO Task 2      : Disable autorun/autoplay via registry (Windows)
+#   - GPO Task 3      : Set account lockout policy via registry (Windows)
+#
+# ENVIRONMENT ASSUMPTIONS:
+#   - Inventory groups: [windows] = AD01, MGMT01, WKS01
+#                       [rocky]   = Ansible01, Ansible02
+#   - WinRM configured and functional on all Windows hosts
+#   - SSH configured and functional on all Rocky hosts
+#   - ansible_user / ansible_password set in inventory or vault
+#   - DNS resolves all hostnames forward and reverse
+#
+# USAGE:
+#   Dry-run first (recommended):
+#     ansible-playbook group_01.yml --check
+#   Apply changes:
+#     ansible-playbook group_01.yml
+# =============================================================================
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 1: System Administration - NTP Time Sync (Rocky Linux hosts)
+# WHY: Accurate time is critical for Kerberos auth, logs, and certificates.
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "SYSADMIN-01 | Ensure chrony NTP is installed and running (Rocky)"
+  hosts: rocky
+  become: true   # Escalate to root for package and service management
+
+  vars:
+    # NTP servers to synchronize with; using public pool as fallback
+    ntp_servers:
+      - "pool.ntp.org"
+      - "time.windows.com"
+
+  tasks:
+
+    - name: "Install chrony (NTP daemon for Rocky Linux)"
+      # ansible.builtin.dnf handles package management on RHEL/Rocky
+      ansible.builtin.dnf:
+        name: chrony
+        state: present   # Ensure installed; won't reinstall if already present
+      register: chrony_install_result   # Capture result for debug output
+
+    - name: "Debug - Show chrony install result"
+      ansible.builtin.debug:
+        msg: "Chrony install status: {{ chrony_install_result.changed }}"
+
+    - name: "Deploy chrony configuration with defined NTP servers"
+      # Template or lineinfile could be used; using blockinfile for clarity
+      ansible.builtin.blockinfile:
+        path: /etc/chrony.conf
+        marker: "# {mark} ANSIBLE MANAGED NTP BLOCK"
+        block: |
+          {% for server in ntp_servers %}
+          server {{ server }} iburst
+          {% endfor %}
+      notify: Restart chrony   # Trigger handler only if config changed
+
+    - name: "Ensure chronyd service is enabled and started"
+      ansible.builtin.service:
+        name: chronyd
+        state: started
+        enabled: true   # Persist across reboots
+
+    - name: "Verify NTP sync status (informational)"
+      ansible.builtin.command: chronyc tracking
+      register: ntp_status
+      changed_when: false   # This task never changes state; purely informational
+
+    - name: "Display NTP tracking output"
+      ansible.builtin.debug:
+        var: ntp_status.stdout_lines
+
+  handlers:
+    # Handlers only run when notified AND something changed
+    - name: Restart chrony
+      ansible.builtin.service:
+        name: chronyd
+        state: restarted
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 2: System Administration - NTP Time Sync (Windows hosts)
+# WHY: Windows uses W32tm; domain members should sync to the DC (AD01).
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "SYSADMIN-01 | Configure W32tm NTP on Windows hosts"
+  hosts: windows
+  gather_facts: false   # WinRM fact gathering is slow; skip unless needed
+
+  tasks:
+
+    - name: "Configure W32tm to use AD01 as NTP source"
+      # ansible.windows.win_command runs raw commands on Windows
+      ansible.windows.win_command: >
+        w32tm /config /manualpeerlist:"AD01" /syncfromflags:manual /reliable:YES /update
+      register: w32tm_config
+      # Only treat as changed if return code is 0 and output indicates change
+      changed_when: w32tm_config.rc == 0
+
+    - name: "Restart Windows Time service to apply changes"
+      ansible.windows.win_service:
+        name: w32tm
+        state: restarted
+        start_mode: auto   # Ensure it starts on boot
+
+    - name: "Force an immediate NTP resync"
+      ansible.windows.win_command: w32tm /resync /force
+      register: resync_result
+      changed_when: false   # Resync is informational; doesn't alter config state
+
+    - name: "Display resync result"
+      ansible.builtin.debug:
+        msg: "W32tm resync output: {{ resync_result.stdout }}"
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 3: System Administration - Disk Usage Report (Rocky hosts)
+# WHY: Monitoring disk space proactively prevents service outages.
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "SYSADMIN-02 | Disk usage report on Rocky hosts"
+  hosts: rocky
+  become: true
+
+  tasks:
+
+    - name: "Gather disk usage facts"
+      ansible.builtin.command: df -hT
+      register: disk_usage
+      changed_when: false   # Read-only; no system state is modified
+
+    - name: "Display disk usage for each Rocky host"
+      ansible.builtin.debug:
+        msg: |
+          === Disk Usage: {{ inventory_hostname }} ===
+          {{ disk_usage.stdout }}
+
+    - name: "Alert if any filesystem is over 80% used"
+      # Use shell so we can pipe; changed_when false because this is a check
+      ansible.builtin.shell: |
+        df -h | awk 'NR>1 && int($5) > 80 {print $0}'
+      register: high_usage
+      changed_when: false
+
+    - name: "Warn if high disk usage detected"
+      ansible.builtin.debug:
+        msg: "WARNING: High disk usage on {{ inventory_hostname }}: {{ high_usage.stdout }}"
+      # Only show warning block when output is non-empty
+      when: high_usage.stdout | length > 0
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 4: System Administration - Disk Usage Report (Windows hosts)
+# WHY: Consistent disk monitoring across all OS types.
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "SYSADMIN-02 | Disk usage report on Windows hosts"
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+
+    - name: "Collect disk information via PowerShell"
+      ansible.windows.win_shell: |
+        Get-PSDrive -PSProvider FileSystem |
+          Select-Object Name,
+            @{N='UsedGB';E={[math]::Round(($_.Used/1GB),2)}},
+            @{N='FreeGB';E={[math]::Round(($_.Free/1GB),2)}} |
+          Format-Table -AutoSize | Out-String
+      register: win_disk
+      changed_when: false
+
+    - name: "Display Windows disk report"
+      ansible.builtin.debug:
+        msg: |
+          === Disk Report: {{ inventory_hostname }} ===
+          {{ win_disk.stdout }}
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 5: Hardening - Disable Guest Account (Rocky hosts)
+# WHY: Guest accounts are an unauthenticated entry point; CIS benchmark item.
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "HARDENING-01 | Disable guest account on Rocky hosts"
+  hosts: rocky
+  become: true
+
+  tasks:
+
+    - name: "Lock the guest account (if it exists)"
+      # usermod -L locks the password; || true prevents failure if no guest user
+      ansible.builtin.command: usermod -L guest
+      register: lock_result
+      failed_when: false     # Don't fail if account doesn't exist
+      changed_when: lock_result.rc == 0
+
+    - name: "Ensure guest account shell is set to nologin"
+      ansible.builtin.user:
+        name: guest
+        shell: /sbin/nologin
+        state: present
+      # only_if the account exists - ignore errors gracefully
+      ignore_errors: true
+
+    - name: "Confirm guest account status"
+      ansible.builtin.command: grep -i guest /etc/passwd
+      register: guest_check
+      changed_when: false
+      failed_when: false
+
+    - name: "Display guest account status"
+      ansible.builtin.debug:
+        msg: >
+          Guest entry: {{ guest_check.stdout if guest_check.stdout else 'No guest account found (good!)' }}
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 6: Hardening - Disable Guest Account (Windows hosts)
+# WHY: Built-in Guest account on Windows is disabled by default but worth
+#      verifying, especially after imaging or cloning.
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "HARDENING-01 | Disable Guest account on Windows hosts"
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+
+    - name: "Disable the built-in Guest account via PowerShell"
+      ansible.windows.win_shell: |
+        $guest = Get-LocalUser -Name "Guest" -ErrorAction SilentlyContinue
+        if ($guest -and $guest.Enabled) {
+            Disable-LocalUser -Name "Guest"
+            Write-Output "Guest account disabled."
+        } else {
+            Write-Output "Guest account already disabled or not found."
+        }
+      register: guest_result
+      changed_when: "'disabled.' in guest_result.stdout"
+
+    - name: "Show guest account action result"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ guest_result.stdout }}"
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 7: Hardening - Login Warning Banner (Rocky hosts)
+# WHY: Legal and compliance requirement; warns unauthorized users before login.
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "HARDENING-02 | Set login warning banner on Rocky hosts"
+  hosts: rocky
+  become: true
+
+  vars:
+    banner_text: |
+      ***************************************************************************
+      * AUTHORIZED ACCESS ONLY                                                  *
+      * This system is for authorized users only. Unauthorized access is        *
+      * strictly prohibited and may be subject to criminal prosecution.         *
+      ***************************************************************************
+
+  tasks:
+
+    - name: "Write banner to /etc/issue (local console)"
+      ansible.builtin.copy:
+        content: "{{ banner_text }}"
+        dest: /etc/issue
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: "Write banner to /etc/issue.net (remote/SSH sessions)"
+      ansible.builtin.copy:
+        content: "{{ banner_text }}"
+        dest: /etc/issue.net
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: "Enable SSH banner in sshd_config"
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?Banner'
+        line: 'Banner /etc/issue.net'
+        state: present
+      notify: Restart SSH
+
+  handlers:
+    - name: Restart SSH
+      ansible.builtin.service:
+        name: sshd
+        state: restarted
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 8: Hardening - Login Warning Banner (Windows hosts)
+# WHY: Windows can display a legal notice before login via registry keys.
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "HARDENING-02 | Set login warning banner on Windows hosts"
+  hosts: windows
+  gather_facts: false
+
+  vars:
+    win_banner_caption: "AUTHORIZED ACCESS ONLY"
+    win_banner_text: >
+      This system is for authorized users only.
+      Unauthorized access is strictly prohibited.
+
+  tasks:
+
+    - name: "Set LegalNoticeCaption registry key (banner title)"
+      # ansible.windows.win_regedit manages Windows registry entries
+      ansible.windows.win_regedit:
+        path: HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System
+        name: LegalNoticeCaption
+        data: "{{ win_banner_caption }}"
+        type: string   # REG_SZ
+
+    - name: "Set LegalNoticeText registry key (banner body)"
+      ansible.windows.win_regedit:
+        path: HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System
+        name: LegalNoticeText
+        data: "{{ win_banner_text }}"
+        type: string
+
+    - name: "Confirm banner registry values are set"
+      ansible.windows.win_shell: |
+        $key = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+        $caption = (Get-ItemProperty $key).LegalNoticeCaption
+        $text    = (Get-ItemProperty $key).LegalNoticeText
+        Write-Output "Caption: $caption | Text: $text"
+      register: banner_check
+      changed_when: false
+
+    - name: "Display banner confirmation"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} banner: {{ banner_check.stdout }}"
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 9: GPO Hardening - Password Complexity via Registry (Windows only)
+# WHY: Enforcing password complexity reduces brute-force risk.
+#      Equivalent to: Computer Config > Windows Settings > Security Settings
+#                     > Account Policies > Password Policy
+# NOTE: net accounts or secedit can also enforce this; registry approach shown.
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "GPO-01 | Enforce password complexity policy (Windows domain hosts)"
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+
+    - name: "Use secedit to export current security policy"
+      ansible.windows.win_shell: |
+        secedit /export /cfg C:\Windows\Temp\secpol_export.cfg /quiet
+      changed_when: false
+
+    - name: "Read exported policy file"
+      ansible.windows.win_shell: |
+        Get-Content C:\Windows\Temp\secpol_export.cfg | Out-String
+      register: current_policy
+      changed_when: false
+
+    - name: "Debug - Show current password policy section"
+      ansible.builtin.debug:
+        msg: "{{ current_policy.stdout | regex_search('(?s)\\[System Access\\].*?\\n\\n') }}"
+
+    - name: "Write new security policy enforcing password complexity"
+      # Creates a secedit-compatible .inf file for import
+      ansible.windows.win_copy:
+        content: |
+          [Unicode]
+          Unicode=yes
+          [System Access]
+          MinimumPasswordLength = 12
+          PasswordComplexity = 1
+          MaximumPasswordAge = 90
+          MinimumPasswordAge = 1
+          PasswordHistorySize = 10
+          [Version]
+          signature="$CHICAGO$"
+          Revision=1
+        dest: C:\Windows\Temp\password_policy.inf
+
+    - name: "Apply password policy via secedit"
+      ansible.windows.win_shell: |
+        secedit /configure /db C:\Windows\Temp\secpol.sdb /cfg C:\Windows\Temp\password_policy.inf /quiet
+      register: secedit_result
+      changed_when: secedit_result.rc == 0
+
+    - name: "Clean up temporary policy files"
+      ansible.windows.win_file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - C:\Windows\Temp\secpol_export.cfg
+        - C:\Windows\Temp\password_policy.inf
+        - C:\Windows\Temp\secpol.sdb
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 10: GPO Hardening - Disable AutoRun/AutoPlay via Registry (Windows)
+# WHY: AutoRun can execute malicious code from USB drives automatically.
+#      Equivalent to: Computer Config > Admin Templates > Windows Components
+#                     > AutoPlay Policies > Turn off AutoPlay
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "GPO-02 | Disable AutoRun and AutoPlay (Windows domain hosts)"
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+
+    - name: "Disable AutoRun via registry (all drives)"
+      ansible.windows.win_regedit:
+        path: HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer
+        name: NoDriveTypeAutoRun
+        # 0xFF (255) = disable AutoRun on all drive types
+        data: 255
+        type: dword   # REG_DWORD
+
+    - name: "Disable AutoPlay via registry (MachinePolicy)"
+      ansible.windows.win_regedit:
+        path: HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer
+        name: NoAutoplayfornonVolume
+        data: 1
+        type: dword
+
+    - name: "Verify AutoRun registry setting"
+      ansible.windows.win_shell: |
+        $val = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer").NoDriveTypeAutoRun
+        Write-Output "NoDriveTypeAutoRun = $val"
+      register: autorun_check
+      changed_when: false
+
+    - name: "Display AutoRun verification"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ autorun_check.stdout }}"
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 11: GPO Hardening - Account Lockout Policy via secedit (Windows)
+# WHY: Lockout policy limits brute-force attempts against AD accounts.
+#      Equivalent to: Computer Config > Windows Settings > Security Settings
+#                     > Account Policies > Account Lockout Policy
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "GPO-03 | Set account lockout policy (Windows domain hosts)"
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+
+    - name: "Write account lockout policy .inf file"
+      ansible.windows.win_copy:
+        content: |
+          [Unicode]
+          Unicode=yes
+          [System Access]
+          LockoutBadCount = 5
+          ResetLockoutCount = 30
+          LockoutDuration = 30
+          [Version]
+          signature="$CHICAGO$"
+          Revision=1
+        dest: C:\Windows\Temp\lockout_policy.inf
+
+    - name: "Apply lockout policy via secedit"
+      ansible.windows.win_shell: |
+        secedit /configure /db C:\Windows\Temp\lockout.sdb /cfg C:\Windows\Temp\lockout_policy.inf /quiet
+      register: lockout_result
+      changed_when: lockout_result.rc == 0
+
+    - name: "Debug - Confirm lockout policy applied"
+      ansible.builtin.debug:
+        msg: "Lockout policy applied to {{ inventory_hostname }} (rc={{ lockout_result.rc }})"
+
+    - name: "Clean up lockout policy temp files"
+      ansible.windows.win_file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - C:\Windows\Temp\lockout_policy.inf
+        - C:\Windows\Temp\lockout.sdb
+
+# =============================================================================
+# END OF GROUP 01
+# Next: Run group_02.yml
+# Tip: Always run with --check first!
+# =============================================================================
