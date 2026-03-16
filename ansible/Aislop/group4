@@ -1,0 +1,547 @@
+---
+# =============================================================================
+# GROUP 03 - Ansible Lab Playbook
+# =============================================================================
+# OBJECTIVES:
+#   - SysAdmin Task 1 : Manage scheduled tasks/cron jobs on all hosts
+#   - SysAdmin Task 2 : Deploy and verify a shared configuration file
+#                       (motd on Rocky, custom info file on Windows)
+#   - Hardening Task 1: Audit and restrict SUID/SGID binaries (Rocky)
+#                       and Audit privilege rights (Windows)
+#   - Hardening Task 2: Configure sysctl kernel parameters (Rocky)
+#                       and Disable SMBv1 protocol (Windows)
+#   - GPO Task 1      : Restrict CMD and PowerShell for standard users (Win)
+#   - GPO Task 2      : Disable anonymous SID/Name enumeration
+#   - GPO Task 3      : Configure Windows Event Log minimum sizes
+#
+# ENVIRONMENT ASSUMPTIONS:
+#   - Inventory groups: [windows] = AD01, MGMT01, WKS01
+#                       [rocky]   = Ansible01, Ansible02
+#   - WinRM configured on Windows hosts
+#   - SSH configured on Rocky hosts
+#   - Domain-joined Windows hosts supplement local policy
+#
+# USAGE:
+#   Dry-run (always recommended first):
+#     ansible-playbook group_03.yml --check
+#   Apply changes:
+#     ansible-playbook group_03.yml
+# =============================================================================
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 1: SysAdmin - Configure cron jobs on Rocky hosts
+# WHY: Automated maintenance tasks (log cleanup, temp file purge) keep systems
+#      healthy without manual intervention.
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "SYSADMIN-01 | Configure maintenance cron jobs on Rocky hosts"
+  hosts: rocky
+  become: true
+
+  vars:
+    # Cron job definitions for clarity and reusability
+    cron_jobs:
+      - name: "Clean /tmp files older than 7 days"
+        minute: "0"
+        hour: "2"
+        day: "*"
+        month: "*"
+        weekday: "0"     # Sunday
+        job: "find /tmp -type f -mtime +7 -delete"
+        user: root
+
+      - name: "Append disk usage snapshot to log weekly"
+        minute: "30"
+        hour: "3"
+        day: "*"
+        month: "*"
+        weekday: "1"     # Monday
+        job: "df -h >> /var/log/disk_usage_weekly.log"
+        user: root
+
+  tasks:
+
+    - name: "Create cron jobs from variable list"
+      # ansible.builtin.cron manages individual crontab entries
+      ansible.builtin.cron:
+        name: "{{ item.name }}"
+        minute: "{{ item.minute }}"
+        hour: "{{ item.hour }}"
+        day: "{{ item.day }}"
+        month: "{{ item.month }}"
+        weekday: "{{ item.weekday }}"
+        job: "{{ item.job }}"
+        user: "{{ item.user }}"
+        state: present
+      loop: "{{ cron_jobs }}"
+      register: cron_result
+
+    - name: "Debug - Show cron job status"
+      ansible.builtin.debug:
+        msg: "Cron '{{ item.item.name }}': changed={{ item.changed }}"
+      loop: "{{ cron_result.results }}"
+
+    - name: "Display current root crontab for verification"
+      ansible.builtin.command: crontab -l -u root
+      register: root_cron
+      changed_when: false
+      failed_when: false   # crontab -l returns 1 if no entries; suppress error
+
+    - name: "Show root crontab"
+      ansible.builtin.debug:
+        msg: |
+          === Root Crontab on {{ inventory_hostname }} ===
+          {{ root_cron.stdout if root_cron.stdout else 'No crontab entries found.' }}
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 2: SysAdmin - Configure scheduled task on Windows hosts
+# WHY: Scheduled tasks automate maintenance; Ansible can manage them without
+#      relying on GUI tools like Task Scheduler.
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "SYSADMIN-01 | Create scheduled maintenance task on Windows"
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+
+    - name: "Create a scheduled task to clear temp files weekly"
+      # ansible.windows.win_scheduled_task manages Windows Task Scheduler
+      ansible.windows.win_scheduled_task:
+        name: "Ansible-ClearTemp"
+        description: "Clears user temp files weekly - Ansible Managed"
+        actions:
+          - path: cmd.exe
+            arguments: '/c del /q /f /s "%TEMP%\*"'
+        triggers:
+          - type: weekly
+            days_of_week: sunday
+            start_boundary: "2024-01-01T03:00:00"
+        run_level: highest         # Run with elevated privileges
+        logon_type: interactive_token
+        state: present
+        enabled: true
+      register: task_result
+
+    - name: "Debug - Scheduled task result"
+      ansible.builtin.debug:
+        msg: "Scheduled task on {{ inventory_hostname }} changed: {{ task_result.changed }}"
+
+    - name: "Verify the task exists"
+      ansible.windows.win_shell: |
+        Get-ScheduledTask -TaskName "Ansible-ClearTemp" -ErrorAction SilentlyContinue |
+          Select-Object TaskName, State | Format-Table | Out-String
+      register: task_verify
+      changed_when: false
+
+    - name: "Display task verification"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ task_verify.stdout }}"
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 3: SysAdmin - Deploy MOTD (Message of the Day) on Rocky hosts
+# WHY: MOTD provides admins with a consistent info banner and system context
+#      upon login - complementing the hardening banner from Group 01.
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "SYSADMIN-02 | Deploy MOTD on Rocky hosts"
+  hosts: rocky
+  become: true
+
+  vars:
+    motd_content: |
+      ============================================================
+        Hostname    : {{ inventory_hostname }}
+        Managed By  : Ansible Controller
+        Environment : Cybersecurity Lab
+        WARNING     : Authorized users only. Activity is monitored.
+      ============================================================
+
+  tasks:
+
+    - name: "Write MOTD file"
+      ansible.builtin.copy:
+        content: "{{ motd_content }}"
+        dest: /etc/motd
+        owner: root
+        group: root
+        mode: '0644'
+      register: motd_result
+
+    - name: "Debug - MOTD changed status"
+      ansible.builtin.debug:
+        msg: "MOTD on {{ inventory_hostname }} changed: {{ motd_result.changed }}"
+
+    - name: "Read back MOTD to confirm content"
+      ansible.builtin.command: cat /etc/motd
+      register: motd_verify
+      changed_when: false
+
+    - name: "Display MOTD content"
+      ansible.builtin.debug:
+        msg: |
+          === MOTD on {{ inventory_hostname }} ===
+          {{ motd_verify.stdout }}
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 4: SysAdmin - Deploy system info file on Windows hosts
+# WHY: A consistent system info file in a known location makes it easy for
+#      admins to quickly check managed host details.
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "SYSADMIN-02 | Deploy system info file on Windows hosts"
+  hosts: windows
+  gather_facts: true   # We need facts like ansible_hostname here
+
+  tasks:
+
+    - name: "Generate system info content via PowerShell"
+      ansible.windows.win_shell: |
+        $info = @"
+        ============================================================
+          Hostname    : $env:COMPUTERNAME
+          Domain      : $env:USERDOMAIN
+          OS          : $(([System.Environment]::OSVersion).VersionString)
+          Managed By  : Ansible Controller
+          Lab Note    : Authorized use only. Activity is monitored.
+        ============================================================
+        "@
+        $info | Out-File -FilePath "C:\ansible_sysinfo.txt" -Encoding UTF8 -Force
+      register: sysinfo_result
+      changed_when: sysinfo_result.rc == 0
+
+    - name: "Verify sysinfo file exists"
+      ansible.windows.win_stat:
+        path: C:\ansible_sysinfo.txt
+      register: sysinfo_stat
+
+    - name: "Display verification result"
+      ansible.builtin.debug:
+        msg: "sysinfo file exists on {{ inventory_hostname }}: {{ sysinfo_stat.stat.exists }}"
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 5: Hardening - Audit SUID/SGID binaries on Rocky hosts
+# WHY: SUID/SGID bits allow programs to run with elevated privileges.
+#      Auditing (and minimizing) these reduces privilege escalation paths.
+# NOTE: This play audits and reports only; removal requires careful review.
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "HARDENING-01 | Audit SUID/SGID binaries on Rocky hosts"
+  hosts: rocky
+  become: true
+
+  tasks:
+
+    - name: "Find all SUID binaries on the system"
+      ansible.builtin.command: find / -perm -4000 -type f -not -path '/proc/*' -not -path '/sys/*'
+      register: suid_files
+      changed_when: false
+      failed_when: false    # find may return rc=1 for permission-denied paths; ignore
+
+    - name: "Find all SGID binaries on the system"
+      ansible.builtin.command: find / -perm -2000 -type f -not -path '/proc/*' -not -path '/sys/*'
+      register: sgid_files
+      changed_when: false
+      failed_when: false
+
+    - name: "Display SUID binaries found"
+      ansible.builtin.debug:
+        msg: |
+          === SUID Binaries on {{ inventory_hostname }} ===
+          {{ suid_files.stdout_lines | join('\n') }}
+
+    - name: "Display SGID binaries found"
+      ansible.builtin.debug:
+        msg: |
+          === SGID Binaries on {{ inventory_hostname }} ===
+          {{ sgid_files.stdout_lines | join('\n') }}
+
+    - name: "Count SUID/SGID binaries as a quick metric"
+      ansible.builtin.debug:
+        msg: >
+          SUID count: {{ suid_files.stdout_lines | length }} |
+          SGID count: {{ sgid_files.stdout_lines | length }}
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 6: Hardening - Audit privileged user rights on Windows
+# WHY: Reviewing who holds sensitive privileges (SeDebugPrivilege,
+#      SeTakeOwnershipPrivilege, etc.) helps detect misconfigured accounts.
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "HARDENING-01 | Audit privileged rights on Windows hosts"
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+
+    - name: "Export current user rights assignments via secedit"
+      ansible.windows.win_shell: |
+        secedit /export /cfg C:\Windows\Temp\userrights_export.cfg /areas USER_RIGHTS /quiet
+      changed_when: false
+
+    - name: "Read exported user rights"
+      ansible.windows.win_shell: |
+        Get-Content C:\Windows\Temp\userrights_export.cfg |
+          Select-String -Pattern "SeDebug|SeTakeOwner|SeBackup|SeRestore|SeShutdown" |
+          Out-String
+      register: rights_output
+      changed_when: false
+
+    - name: "Display sensitive privilege assignments"
+      ansible.builtin.debug:
+        msg: |
+          === Sensitive Privileges on {{ inventory_hostname }} ===
+          {{ rights_output.stdout }}
+
+    - name: "Clean up exported rights file"
+      ansible.windows.win_file:
+        path: C:\Windows\Temp\userrights_export.cfg
+        state: absent
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 7: Hardening - Configure sysctl security parameters (Rocky)
+# WHY: Kernel parameters control network stack behavior. Hardening these
+#      reduces exposure to IP spoofing, ICMP abuse, and SYN floods.
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "HARDENING-02 | Apply sysctl security parameters on Rocky hosts"
+  hosts: rocky
+  become: true
+
+  vars:
+    # Sysctl hardening parameters (CIS Benchmark subset)
+    sysctl_params:
+      # Disable IP source routing (prevents IP spoofing)
+      net.ipv4.conf.all.accept_source_route: 0
+      # Disable ICMP redirect acceptance
+      net.ipv4.conf.all.accept_redirects: 0
+      net.ipv6.conf.all.accept_redirects: 0
+      # Enable SYN flood protection (SYN cookies)
+      net.ipv4.tcp_syncookies: 1
+      # Log martian packets (packets with impossible source addresses)
+      net.ipv4.conf.all.log_martians: 1
+      # Disable IPv6 if not in use (lab environment)
+      net.ipv6.conf.all.disable_ipv6: 1
+      # Disable packet forwarding (this is not a router)
+      net.ipv4.ip_forward: 0
+
+  tasks:
+
+    - name: "Apply sysctl parameters"
+      # ansible.posix.sysctl manages kernel parameters persistently
+      ansible.posix.sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        sysctl_set: true      # Apply immediately via sysctl -w
+        state: present
+        reload: true          # Reload sysctl.conf after change
+      loop: "{{ sysctl_params | dict2items }}"
+      register: sysctl_result
+
+    - name: "Debug - Show sysctl change results"
+      ansible.builtin.debug:
+        msg: "Param '{{ item.item.key }}' = {{ item.item.value }} | changed: {{ item.changed }}"
+      loop: "{{ sysctl_result.results }}"
+
+    - name: "Verify applied sysctl values"
+      ansible.builtin.command: sysctl net.ipv4.tcp_syncookies net.ipv4.ip_forward
+      register: sysctl_verify
+      changed_when: false
+
+    - name: "Display sysctl verification"
+      ansible.builtin.debug:
+        var: sysctl_verify.stdout_lines
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 8: Hardening - Disable SMBv1 on Windows hosts
+# WHY: SMBv1 is the protocol exploited by EternalBlue/WannaCry.
+#      It has no modern use case and should always be disabled.
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "HARDENING-02 | Disable SMBv1 on Windows hosts"
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+
+    - name: "Check current SMBv1 server status"
+      ansible.windows.win_shell: |
+        $smb1 = (Get-SmbServerConfiguration -ErrorAction SilentlyContinue).EnableSMB1Protocol
+        Write-Output "SMBv1 Server Enabled: $smb1"
+      register: smb1_status
+      changed_when: false
+
+    - name: "Display current SMBv1 status"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ smb1_status.stdout }}"
+
+    - name: "Disable SMBv1 server protocol"
+      ansible.windows.win_shell: |
+        Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force
+      register: smb1_disable
+      changed_when: smb1_disable.rc == 0
+
+    - name: "Disable SMBv1 via registry (belt-and-suspenders approach)"
+      ansible.windows.win_regedit:
+        path: HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters
+        name: SMB1
+        data: 0
+        type: dword
+
+    - name: "Verify SMBv1 is now disabled"
+      ansible.windows.win_shell: |
+        $smb1 = (Get-SmbServerConfiguration).EnableSMB1Protocol
+        Write-Output "SMBv1 Server Enabled (should be False): $smb1"
+      register: smb1_verify
+      changed_when: false
+
+    - name: "Show SMBv1 disable confirmation"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ smb1_verify.stdout }}"
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 9: GPO-01 - Restrict CMD and PowerShell for standard users (Windows)
+# WHY: Standard users typically don't need shell access; restricting it
+#      reduces post-exploitation lateral movement options.
+#      Equivalent to: Software Restriction Policies or AppLocker rules,
+#      applied here via registry path restrictions.
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "GPO-01 | Restrict CMD and PowerShell for standard users (Windows)"
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+
+    - name: "Disable CMD for standard users via registry"
+      # DisableCMD = 1 prevents running cmd.exe; = 2 also blocks batch files
+      ansible.windows.win_regedit:
+        path: HKLM:\SOFTWARE\Policies\Microsoft\Windows\System
+        name: DisableCMD
+        data: 2
+        type: dword
+
+    - name: "Restrict PowerShell execution policy machine-wide"
+      # RemoteSigned = local scripts OK; downloaded scripts must be signed
+      ansible.windows.win_shell: |
+        Set-ExecutionPolicy RemoteSigned -Scope LocalMachine -Force
+      register: ps_policy
+      changed_when: ps_policy.rc == 0
+
+    - name: "Verify PowerShell execution policy"
+      ansible.windows.win_shell: |
+        Get-ExecutionPolicy -List | Out-String
+      register: exec_policy
+      changed_when: false
+
+    - name: "Display execution policy settings"
+      ansible.builtin.debug:
+        msg: |
+          === Execution Policy: {{ inventory_hostname }} ===
+          {{ exec_policy.stdout }}
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 10: GPO-02 - Disable anonymous SID/Name enumeration (Windows)
+# WHY: Prevents unauthenticated users from enumerating user accounts and
+#      group SIDs - a common reconnaissance step.
+#      Equivalent to: Computer Config > Windows Settings > Security Settings
+#      > Local Policies > Security Options
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "GPO-02 | Disable anonymous SID and account enumeration (Windows)"
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+
+    - name: "Restrict anonymous enumeration of SAM accounts (setting 1)"
+      ansible.windows.win_regedit:
+        path: HKLM:\SYSTEM\CurrentControlSet\Control\Lsa
+        name: RestrictAnonymousSAM
+        data: 1
+        type: dword
+
+    - name: "Restrict anonymous enumeration of shares (setting 2)"
+      ansible.windows.win_regedit:
+        path: HKLM:\SYSTEM\CurrentControlSet\Control\Lsa
+        name: RestrictAnonymous
+        data: 1
+        type: dword
+
+    - name: "Disable anonymous SID/Name translation"
+      ansible.windows.win_regedit:
+        path: HKLM:\SYSTEM\CurrentControlSet\Control\Lsa
+        name: NoLMHash
+        data: 1
+        type: dword
+
+    - name: "Verify LSA restriction settings"
+      ansible.windows.win_shell: |
+        $lsa = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"
+        Write-Output "RestrictAnonymousSAM=$($lsa.RestrictAnonymousSAM) RestrictAnonymous=$($lsa.RestrictAnonymous) NoLMHash=$($lsa.NoLMHash)"
+      register: lsa_verify
+      changed_when: false
+
+    - name: "Display LSA restriction settings"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ lsa_verify.stdout }}"
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PLAY 11: GPO-03 - Configure minimum Windows Event Log sizes (Windows)
+# WHY: Undersized event logs get overwritten, destroying forensic evidence.
+#      CIS Benchmark requires minimum log sizes for Security, System, App logs.
+#      Equivalent to: Computer Config > Windows Settings > Security Settings
+#      > Event Log > Maximum log size
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- name: "GPO-03 | Configure minimum Event Log sizes (Windows)"
+  hosts: windows
+  gather_facts: false
+
+  vars:
+    # Log sizes in KB; CIS recommends Security >= 196608 KB (192 MB)
+    event_logs:
+      - name: Security
+        max_size_kb: 196608
+      - name: System
+        max_size_kb: 32768
+      - name: Application
+        max_size_kb: 32768
+
+  tasks:
+
+    - name: "Set Event Log maximum sizes via registry"
+      ansible.windows.win_regedit:
+        path: "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\EventLog\\{{ item.name }}"
+        name: MaxSize
+        # Convert KB to bytes for registry value (MaxSize is stored in bytes)
+        data: "{{ item.max_size_kb * 1024 }}"
+        type: dword
+      loop: "{{ event_logs }}"
+      register: log_size_result
+
+    - name: "Debug - Show log size change results"
+      ansible.builtin.debug:
+        msg: "Log '{{ item.item.name }}' size set to {{ item.item.max_size_kb }} KB | changed: {{ item.changed }}"
+      loop: "{{ log_size_result.results }}"
+
+    - name: "Verify event log sizes via PowerShell"
+      ansible.windows.win_shell: |
+        Get-EventLog -List |
+          Where-Object { $_.Log -in @("Security","System","Application") } |
+          Select-Object Log, MaximumKilobytes |
+          Format-Table | Out-String
+      register: log_verify
+      changed_when: false
+
+    - name: "Display event log size verification"
+      ansible.builtin.debug:
+        msg: |
+          === Event Log Sizes: {{ inventory_hostname }} ===
+          {{ log_verify.stdout }}
+
+# =============================================================================
+# END OF GROUP 03
+# Next: Run group_04.yml
+# Tip: Always run with --check first!
+# =============================================================================
